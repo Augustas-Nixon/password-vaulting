@@ -203,22 +203,31 @@ def create_vault(threshold: int, total: int, wrap: bool):
 
     audit("init", {"threshold": threshold, "total": total})
 
-def unwrap_share_if_needed(s: str) -> str:
-    """If share is wrapped JSON, prompt user for passphrase and decrypt it."""
+def unwrap_share_if_needed(s: str, prompt_callback=None) -> str:
+    """
+    If share is wrapped JSON, unwrap it.
+    Uses prompt_callback() to get the passphrase (GUI or CLI fallback).
+    """
     s = s.strip()
     if s.startswith("{") and s.endswith("}"):
         obj = json.loads(s)
-        # Tkinter popup for passphrase (masked)
-        pw = simpledialog.askstring("Passphrase Required",
-                                    "Enter passphrase for this wrapped share:",
-                                    show="*")
-        if pw is None or pw.strip() == "":
-            raise ValueError("No passphrase entered for wrapped share")
+        # Ask for passphrase using provided callback, or fallback to CLI
+        if prompt_callback:
+            pw = prompt_callback()
+        else:
+            import getpass
+            pw = getpass.getpass("Enter passphrase for this wrapped share: ")
+
+        if not pw:
+            raise ValueError("No passphrase entered for wrapped share.")
+
         salt = b64d(obj["salt"])
         k = argon2id(pw, salt, 32)
         sh = aesgcm_decrypt(k, Blob(nonce=obj["nonce"], ciphertext=obj["ciphertext"]))
         return sh.decode("utf-8")
+
     return s
+
 
 def read_shares_interactively(min_count: int) -> List[str]:
     print(f"Paste at least {min_count} share(s). End with an empty line:")
@@ -287,31 +296,66 @@ def show_entry(index: int):
     print(f"Site: {e['site']}\nUser: {e['username']}\nPassword: {e['password']}")
     audit("show_entry", {"index": index, "site": e["site"]})
 
-def rotate_shares(new_threshold: int, new_total: int, wrap: bool):
-    # Need to unlock with current shares to derive same master key, then re-split
-    meta = load_meta()
-    shares = read_shares_interactively(meta["threshold"])
-    master_key, _ = unlock_with_shares(shares)
+def rotate_shares(new_threshold: int, new_total: int, wrap: bool, passphrases: Optional[List[str]] = None, existing_shares: Optional[List[str]] = None):
+    """
+    Re-split the same master key with new threshold/total parameters.
+    GUI-safe: no terminal input; accepts shares from UI.
+    """
+    try:
+        meta = load_meta()
 
-    # Create new shares from same master key
-    new_shares = split_key(master_key, new_threshold, new_total)
-    write_meta({"threshold": new_threshold, "total": new_total, "aad": b64e(AAL)})
-    print(f"✅ Rotated shares. New policy: {new_threshold}-of-{new_total}\nDistribute new shares:")
-    if wrap:
+        # ✅ Use GUI-provided shares instead of asking via terminal
+        shares = existing_shares or read_shares_interactively(meta["threshold"])
+        master_key, _ = unlock_with_shares(shares)
+
+        # Ensure key is hex string
+        key_hex = master_key.hex() if isinstance(master_key, bytes) else master_key
+
+        # Generate new shares
+        new_shares = split_key(bytes.fromhex(key_hex), new_threshold, new_total)
+
+        # Update metadata
+        meta.update({
+            "threshold": new_threshold,
+            "total": new_total,
+            "rotated_on": now_iso(),
+            "aad": b64e(AAL)
+        })
+        write_meta(meta)
+
+        # Wrap if requested
+        wrapped_outputs = []
         for i, sh in enumerate(new_shares, 1):
-            pw = getpass.getpass(f"Set passphrase for new Share #{i} (blank to skip): ")
-            if pw:
+            if wrap and passphrases and passphrases[i - 1]:
+                pw = passphrases[i - 1]
                 salt = secrets.token_bytes(16)
                 k = argon2id(pw, salt, 32)
                 blob = aesgcm_encrypt(k, sh.encode("utf-8"))
-                payload = {"salt": b64e(salt), "nonce": blob.nonce, "ciphertext": blob.ciphertext}
-                print(f"Share #{i} (WRAPPED JSON): {json.dumps(payload)}")
+                payload = {
+                    "salt": b64e(salt),
+                    "nonce": blob.nonce,
+                    "ciphertext": blob.ciphertext
+                }
+                wrapped_outputs.append(f"Share #{i} (WRAPPED JSON): {json.dumps(payload)}")
             else:
-                print(f"Share #{i}: {sh}")
-    else:
-        for i, sh in enumerate(new_shares, 1):
-            print(f"Share #{i}: {sh}")
-    audit("rotate_shares", {"new_threshold": new_threshold, "new_total": new_total})
+                wrapped_outputs.append(f"Share #{i}: {sh}")
+
+        audit("rotate_shares", {"new_threshold": new_threshold, "new_total": new_total})
+        return wrapped_outputs
+
+    except Exception as e:
+        audit("rotate_shares_failed", {
+            "error": str(e),
+            "new_threshold": new_threshold,
+            "new_total": new_total
+        })
+        backup_file = f"meta_backup_{int(time.time())}.json"
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump(meta, f, indent=2)
+        raise RuntimeError(f"Error during rotation: {e}\nOld metadata backed up to {backup_file}")
+
+
+
 
 def check_strength(password: str):
     rep = strength_report(password)

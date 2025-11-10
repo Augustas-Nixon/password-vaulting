@@ -19,21 +19,28 @@ def ask_shares(threshold):
         shares = txt.get("1.0", tk.END).strip().splitlines()
         if len(shares) < threshold:
             messagebox.showerror("Error", f"You must enter at least {threshold} shares.")
-        else:
-            # unwrap if JSON-wrapped
-            unwrapped = []
-            for s in shares:
-                try:
-                    unwrapped.append(vault.unwrap_share_if_needed(s))
-                except Exception as e:
-                    messagebox.showerror("Error", f"Failed to unwrap share: {e}")
-                    return
-            result.extend(unwrapped)
-            root.destroy()
+            return
+
+        unwrapped = []
+        for s in shares:
+            try:
+                def gui_prompt():
+                    return simpledialog.askstring(
+                        "Passphrase Required",
+                        "Enter passphrase for this wrapped share:",
+                        show="*"
+                    )
+                unwrapped.append(vault.unwrap_share_if_needed(s, gui_prompt))
+            except Exception as e:
+                messagebox.showerror("Error", f"Failed to unwrap share: {e}")
+                return
+        result.extend(unwrapped)
+        root.destroy()
 
     tk.Button(root, text="OK", command=on_ok).pack(pady=5)
     root.wait_window()
     return result
+
 
 
 # ---------- Actions ----------
@@ -144,21 +151,55 @@ def show_entry():
 
 def rotate_shares():
     meta = vault.load_meta()
-    shares = ask_shares(meta["threshold"])
+    shares = ask_shares(meta["threshold"])  # GUI prompt for shares
     threshold = simpledialog.askinteger("Rotate Shares", "New threshold:")
     total = simpledialog.askinteger("Rotate Shares", "New total shares:")
+
     if threshold and total:
         wrap = messagebox.askyesno("Wrap Shares", "Protect new shares with passphrases?")
+        passphrases = []
+
+        if wrap:
+            messagebox.showinfo(
+                "Passphrases",
+                f"You’ll now be asked to set passphrases for {total} new shares."
+            )
+            for i in range(total):
+                pw = simpledialog.askstring(
+                    "Share Passphrase",
+                    f"Set passphrase for new Share #{i + 1} (leave blank to skip):",
+                    show="*"
+                )
+                passphrases.append(pw or "")
+
         try:
-            vault.unlock_with_shares(shares)  # ensure correct before rotating
-            vault.rotate_shares(threshold, total, wrap)
+            vault.unlock_with_shares(shares)  # Confirm old shares are valid
+
+            # ✅ Pass the shares from GUI into vault backend
+            new_shares = vault.rotate_shares(
+                threshold, total, wrap,
+                passphrases,
+                existing_shares=shares
+            )
+
+            # Display new shares in a scrollable window
+            txt_window = tk.Toplevel()
+            txt_window.title("New Shares")
+            tk.Label(txt_window, text="Distribute the following new shares securely:").pack(pady=5)
+            box = scrolledtext.ScrolledText(txt_window, width=80, height=20)
+            box.pack(padx=10, pady=10)
+            box.insert(tk.END, "\n".join(new_shares))
+            box.configure(state="disabled")
+
             messagebox.showinfo(
                 "Success",
                 f"Shares rotated to {threshold}-of-{total}.\n\n"
-                f"New shares are printed in the Run console."
+                f"New shares are shown in a new window."
             )
+
         except Exception as e:
             messagebox.showerror("Error", str(e))
+
 
 
 # ---------- Main Window ----------
